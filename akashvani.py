@@ -11,11 +11,12 @@ import wave
 import tempfile
 import subprocess
 import threading
-import queue
 import time
 
-import pyaudio
+import sounddevice as sd
+import numpy as np
 import pyperclip
+import ctypes
 from faster_whisper import WhisperModel
 from pynput import keyboard
 
@@ -25,7 +26,6 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")  # tiny.en / base.en 
 SAMPLE_RATE   = 16000
 CHANNELS      = 1
 CHUNK         = 1024
-AUDIO_FORMAT  = pyaudio.paInt16
 MIN_DURATION    = 0.3   # seconds — ignore accidental taps shorter than this
 TOGGLE_DEBOUNCE = 0.3   # seconds — ignore rapid presses (X11 auto-repeat)
 
@@ -34,13 +34,12 @@ recording        = False
 audio_frames     = []
 record_lock      = threading.Lock()
 model            = None
-pa               = None
 last_toggle_time: float = 0.0
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 
 def start_recording():
-    global recording, audio_frames, stream
+    global recording, audio_frames
     with record_lock:
         if recording:
             return
@@ -59,35 +58,29 @@ def stop_recording():
     return True
 
 
+def audio_callback(indata, frames, time_info, status):
+    if recording:
+        audio_frames.append(indata.copy())
+
+
 def audio_loop():
-    """Background thread: capture mic while recording=True."""
-    global pa, audio_frames
-    pa = pyaudio.PyAudio()
-    stream = pa.open(
-        format=AUDIO_FORMAT,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=CHUNK,
-    )
-    while True:
-        try:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-        except Exception:
-            time.sleep(0.01)
-            continue
-        if recording:
-            audio_frames.append(data)
+    """Background thread: open mic stream and keep it alive."""
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                        dtype="int16", blocksize=CHUNK,
+                        callback=audio_callback):
+        while True:
+            time.sleep(0.1)
 
 
 def save_wav(frames) -> str:
-    """Write PCM frames to a temp WAV file and return its path."""
+    """Write captured numpy frames to a temp WAV file and return its path."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    audio_data = np.concatenate(frames, axis=0)
     with wave.open(tmp.name, "wb") as wf:
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(pa.get_sample_size(AUDIO_FORMAT))
+        wf.setsampwidth(2)  # int16 = 2 bytes
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(b"".join(frames))
+        wf.writeframes(audio_data.tobytes())
     return tmp.name
 
 
@@ -108,24 +101,57 @@ def transcribe(wav_path: str) -> str:
 # ── Type text into active window ───────────────────────────────────────────────
 
 def type_text(text: str):
-    """Copy to clipboard then paste — works in every app including terminals."""
+    """Copy to clipboard then paste with Ctrl+V — works in every Windows app."""
     if not text:
         return
-    try:
-        pyperclip.copy(text)
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
-                       check=False)
-    except Exception:
-        # Fallback: xdotool type (slower but works when clipboard paste fails)
-        subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text],
-                       check=False)
+    pyperclip.copy(text)
+    # Simulate Ctrl+V via Windows SendInput
+    VK_CONTROL, VK_V = 0x11, 0x56
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+    class INPUT(ctypes.Structure):
+        class _INPUT(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+        _anonymous_ = ("_input",)
+        _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT)]
+
+    def make_key(vk, flags=0):
+        i = INPUT()
+        i.type = INPUT_KEYBOARD
+        i.ki.wVk = vk
+        i.ki.dwFlags = flags
+        return i
+
+    inputs = [
+        make_key(VK_CONTROL),
+        make_key(VK_V),
+        make_key(VK_V, KEYEVENTF_KEYUP),
+        make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+    ]
+    arr = (INPUT * len(inputs))(*inputs)
+    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
 
 def notify(msg: str):
-    """Desktop notification (best-effort)."""
+    """Desktop notification via Windows balloon tooltip (best-effort)."""
     try:
-        subprocess.run(["notify-send", "-t", "3000", "SoupaWhisper", msg],
-                       check=False, capture_output=True)
+        ctypes.windll.user32.MessageBeep(0)
+        # Use a non-blocking thread to show a Windows toast via PowerShell
+        cmd = (
+            f'powershell -WindowStyle Hidden -Command "'
+            f'[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;'
+            f'$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01);'
+            f'$t.GetElementsByTagName(\'text\')[0].AppendChild($t.CreateTextNode(\'{msg[:80].replace(chr(39), "")}\')) | Out-Null;'
+            f'[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\'Akash Vani\').Show([Windows.UI.Notifications.ToastNotification]::new($t))'
+            f'"'
+        )
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
