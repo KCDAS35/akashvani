@@ -20,6 +20,12 @@ import ctypes
 from faster_whisper import WhisperModel
 from pynput import keyboard
 
+try:
+    import tkinter as tk
+    HAVE_TK = True
+except Exception:
+    HAVE_TK = False
+
 # ── Config ────────────────────────────────────────────────────────────────────
 TRIGGER_KEY   = keyboard.Key.f12   # Hold to record, release to transcribe
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")  # tiny.en / base.en / small.en
@@ -35,6 +41,7 @@ audio_frames     = []
 record_lock      = threading.Lock()
 model            = None
 last_toggle_time: float = 0.0
+mic_ui           = None
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 
@@ -156,36 +163,132 @@ def notify(msg: str):
         pass
 
 
-# ── Key listener ──────────────────────────────────────────────────────────────
+# ── Toggle (shared by F12 and floating-mic click) ─────────────────────────────
 
 press_time: float = 0.0
 
 
-def on_press(key):
+def _ui_state(state: str):
+    if mic_ui is not None:
+        mic_ui.root.after(0, mic_ui.set_state, state)
+
+
+def toggle():
     global press_time, last_toggle_time
-    if key != TRIGGER_KEY:
-        return
     now = time.monotonic()
     if now - last_toggle_time < TOGGLE_DEBOUNCE:
-        return  # auto-repeat or accidental double-tap — ignore
+        return
     last_toggle_time = now
 
     if not recording:
         press_time = now
         start_recording()
+        _ui_state("recording")
     else:
         duration = now - press_time
         frames_snapshot = list(audio_frames)
         stop_recording()
         if duration < MIN_DURATION or not frames_snapshot:
             print(f"⚡ Too short, ignoring. (duration={duration:.2f}s, frames={len(frames_snapshot)})", flush=True)
+            _ui_state("idle")
             return
-        # Transcribe in a thread so the key listener stays responsive
+        _ui_state("thinking")
         threading.Thread(
             target=process_audio,
             args=(frames_snapshot,),
             daemon=True,
         ).start()
+
+
+def on_press(key):
+    if key != TRIGGER_KEY:
+        return
+    toggle()
+
+
+# ── Floating mic UI ───────────────────────────────────────────────────────────
+
+class FloatingMic:
+    """Always-on-top draggable mic button. Click toggles recording."""
+
+    SIZE = 80
+    MARGIN = 30
+
+    STATES = {
+        "idle":      {"fill": "#1e1e1e", "ring": "#555555", "text": "🎙"},
+        "recording": {"fill": "#c81e1e", "ring": "#ff6464", "text": "⏹"},
+        "thinking":  {"fill": "#1e64c8", "ring": "#64a0ff", "text": "💬"},
+    }
+
+    def __init__(self, on_click):
+        self.root = tk.Tk()
+        self.root.title("akashvani")
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        try:
+            self.root.attributes("-alpha", 0.92)
+        except Exception:
+            pass
+
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = sw - self.SIZE - self.MARGIN
+        y = sh - self.SIZE - self.MARGIN
+        self.root.geometry(f"{self.SIZE}x{self.SIZE}+{x}+{y}")
+
+        bg = self.STATES["idle"]["fill"]
+        self.canvas = tk.Canvas(
+            self.root, width=self.SIZE, height=self.SIZE,
+            highlightthickness=0, bg=bg,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        pad = 2
+        self.disc = self.canvas.create_oval(
+            pad, pad, self.SIZE - pad, self.SIZE - pad,
+            fill=bg, outline=self.STATES["idle"]["ring"], width=2,
+        )
+        self.label = self.canvas.create_text(
+            self.SIZE // 2, self.SIZE // 2,
+            text=self.STATES["idle"]["text"],
+            fill="#ffffff", font=("Sans", 28),
+        )
+
+        for tag in (self.canvas, "<Button-1>", "<B1-Motion>", "<ButtonRelease-1>"):
+            pass
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+
+        self._on_click = on_click
+        self._dragging = False
+        self._origin = (0, 0)
+        self._win_origin = (0, 0)
+
+    def _press(self, e):
+        self._dragging = False
+        self._origin = (e.x_root, e.y_root)
+        self._win_origin = (self.root.winfo_x(), self.root.winfo_y())
+
+    def _drag(self, e):
+        dx = e.x_root - self._origin[0]
+        dy = e.y_root - self._origin[1]
+        if abs(dx) > 4 or abs(dy) > 4:
+            self._dragging = True
+        self.root.geometry(f"+{self._win_origin[0] + dx}+{self._win_origin[1] + dy}")
+
+    def _release(self, e):
+        if not self._dragging:
+            self._on_click()
+
+    def set_state(self, state: str):
+        s = self.STATES.get(state, self.STATES["idle"])
+        self.canvas.config(bg=s["fill"])
+        self.canvas.itemconfig(self.disc, fill=s["fill"], outline=s["ring"])
+        self.canvas.itemconfig(self.label, text=s["text"])
+
+    def run(self):
+        self.root.mainloop()
 
 
 def process_audio(frames):
@@ -201,28 +304,34 @@ def process_audio(frames):
             print("🔇 Nothing detected.", flush=True)
     finally:
         os.unlink(wav_path)
+        _ui_state("idle")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global model
+    global model, mic_ui
 
     print(f"🌌 Akash Vani — loading model '{WHISPER_MODEL}' ...", flush=True)
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    print("✅ Model ready. Press F12 to start recording, press again to stop. Ctrl+C to quit.\n", flush=True)
+    print("✅ Model ready. F12 or click the floating mic. Ctrl+C to quit.\n", flush=True)
 
-    # Start audio capture thread
-    t = threading.Thread(target=audio_loop, daemon=True)
-    t.start()
+    threading.Thread(target=audio_loop, daemon=True).start()
+    keyboard.Listener(on_press=on_press).start()
 
-    # Start key listener (blocking)
-    with keyboard.Listener(on_press=on_press) as listener:
+    if HAVE_TK and os.environ.get("DISPLAY"):
         try:
-            listener.join()
-        except KeyboardInterrupt:
-            print("\n👋 Bye!", flush=True)
-            sys.exit(0)
+            mic_ui = FloatingMic(on_click=toggle)
+            mic_ui.run()
+            return
+        except Exception as e:
+            print(f"⚠ Floating mic failed ({e}); falling back to F12-only.", flush=True)
+
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\n👋 Bye!", flush=True)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
