@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+rclone-current-linux-amd64.zip
+rclone-v*/
